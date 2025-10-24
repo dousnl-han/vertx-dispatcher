@@ -6,7 +6,8 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
+// 在文件顶部导入 JSON 类
+import com.alibaba.fastjson.JSON;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -24,7 +25,7 @@ public class VertxHealthChecker {
     private final Map<String, VertxCircuitBreaker> circuitBreakers = new ConcurrentHashMap<>();
 
     // 健康检查间隔（毫秒）
-    private static final long HEALTH_CHECK_INTERVAL = 30000; // 30秒
+    private static final long HEALTH_CHECK_INTERVAL = 50000; // 50秒
 
     public VertxHealthChecker(Vertx vertx) {
         this.vertx = vertx;
@@ -57,7 +58,7 @@ public class VertxHealthChecker {
                     if (isHealthy) {
                         log.debug("服务 {} 健康检查通过", serviceName);
                         Map registry = VertxDispatcher.getRegistry();
-                        registry.forEach((key, value) -> {log.info("服务：{},服务地址：{}", key, value);});
+                        registry.forEach((key, value) -> {log.info("服务：{},服务地址：{}", key, JSON.toJSONString(value));});
                     } else {
                         log.warn("服务 {} 健康检查失败", serviceName);
                     }

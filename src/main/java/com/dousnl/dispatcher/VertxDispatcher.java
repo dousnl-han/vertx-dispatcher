@@ -172,28 +172,42 @@ public class VertxDispatcher {
     public io.vertx.core.Future<VertxDispatchResult> dispatchRequestAsync(VertxDispatchRequest request) {
         return io.vertx.core.Future.future(promise -> {
             try {
+                log.info("开始处理分发请求: {}", request.getRequestId());
+                log.debug("请求详情: 方法={}, 路径={}, 请求体长度={}", 
+                         request.getMethod(), request.getPath(), request.getBody().length());
+                
                 // 1. 确定目标服务
                 String targetService = determineTargetService(request);
-                log.debug("目标服务: {} -> {}", request.getPath(), targetService);
+                log.info("确定目标服务: {} -> {}", request.getPath(), targetService);
 
                 // 2. 获取可用项目
                 List<VertxAggregateProject> availableProjects = getAvailableProjects(targetService);
 
                 if (availableProjects.isEmpty()) {
+                    log.error("没有可用的聚合项目: {}", targetService);
                     promise.complete(VertxDispatchResult.failure("没有可用的聚合项目: " + targetService));
                     return;
                 }
 
                 // 3. 负载均衡选择
                 VertxAggregateProject selectedProject = loadBalancer.select(availableProjects, request);
+                log.info("负载均衡选择项目: {} -> {}", targetService, selectedProject.getEndpoint());
 
                 // 4. 执行分发
                 executeDispatchAsync(request, selectedProject)
-                        .onSuccess(promise::complete)
-                        .onFailure(promise::fail);
+                        .onSuccess(result -> {
+                            log.info("分发请求成功: {} -> {} ({}ms)", 
+                                    request.getRequestId(), selectedProject.getEndpoint(), result.getProcessingTime());
+                            promise.complete(result);
+                        })
+                        .onFailure(throwable -> {
+                            log.error("分发请求失败: {} -> {}", 
+                                    request.getRequestId(), selectedProject.getEndpoint(), throwable);
+                            promise.fail(throwable);
+                        });
 
             } catch (Exception e) {
-                log.error("分发异常: {}", e.getMessage(), e);
+                log.error("分发异常: {} - {}", request.getRequestId(), e.getMessage(), e);
                 promise.complete(VertxDispatchResult.failure("分发异常: " + e.getMessage()));
             }
         });
@@ -205,29 +219,38 @@ public class VertxDispatcher {
     private String determineTargetService(VertxDispatchRequest request) {
         String host = request.getHeaders().getString("Host", "").toLowerCase();
         String path = request.getPath();
+        
+        log.debug("确定目标服务 - Host: {}, Path: {}", host, path);
 
         // 基于域名和路径的路由规则
         if (host.contains("dushu.com")) {
+            log.debug("匹配dushu.com域名");
             if (path.startsWith("/user-orch/")) {
+                log.debug("匹配user-orch路径");
                 return "user-orch";
             }
             if (path.startsWith("/order-orch/")) {
+                log.debug("匹配order-orch路径");
                 return "order-orch";
             }
         }
 
         // 兼容原有规则
-
         if (path.startsWith("/springboot-grpc-server/")) {
+            log.debug("匹配springboot-grpc-server路径");
             return "springboot-grpc-server";
         } else if (path.startsWith("/order/")) {
+            log.debug("匹配order-service路径");
             return "order-service";
         } else if (path.startsWith("/product/")) {
+            log.debug("匹配product-service路径");
             return "product-service";
         } else if (path.startsWith("/payment/")) {
+            log.debug("匹配payment-service路径");
             return "payment-service";
         }
 
+        log.debug("使用默认服务");
         return "default-service";
     }
 
@@ -235,10 +258,23 @@ public class VertxDispatcher {
      * 获取可用项目
      */
     private List<VertxAggregateProject> getAvailableProjects(String serviceName) {
-        List<VertxAggregateProject> projects = projectRegistry.getOrDefault(serviceName, new ArrayList<>());
-        return projects.stream()
+        List<VertxAggregateProject> allProjects = projectRegistry.getOrDefault(serviceName, new ArrayList<>());
+        log.debug("服务 {} 注册的项目总数: {}", serviceName, allProjects.size());
+        
+        List<VertxAggregateProject> healthyProjects = allProjects.stream()
                 .filter(VertxAggregateProject::isHealthy)
                 .toList();
+                
+        log.debug("服务 {} 健康项目数: {}", serviceName, healthyProjects.size());
+        
+        if (healthyProjects.isEmpty()) {
+            log.warn("服务 {} 没有健康的项目可用", serviceName);
+            allProjects.forEach(project -> {
+                log.debug("项目详情: {} - 健康状态: {}", project.getEndpoint(), project.isHealthy());
+            });
+        }
+        
+        return healthyProjects;
     }
 
     /**
@@ -250,75 +286,197 @@ public class VertxDispatcher {
         return io.vertx.core.Future.future(promise -> {
             long startTime = System.currentTimeMillis();
 
-            log.info("分发请求: {} -> {}", request.getRequestId(), project.getEndpoint());
+            log.info("开始分发请求: {} -> {}", request.getRequestId(), project.getEndpoint());
+            log.debug("请求详情 - 方法: {}, 路径: {}, 请求体: {}", 
+                     request.getMethod(), request.getPath(), request.getBody());
 
-            // 获取HTTP客户端
-            HttpClient client = getOrCreateHttpClient(project.getEndpoint());
+            try {
+                // 获取HTTP客户端
+                HttpClient client = getOrCreateHttpClient(project.getEndpoint());
+                log.debug("获取到HTTP客户端: {}", project.getEndpoint());
 
-            // 构建请求
-            HttpMethod httpMethod = HttpMethod.valueOf(request.getMethod());
-            String fullUrl = project.getEndpoint() + request.getPath();
-            //Future<HttpClientRequest> clientRequest = client.request(httpMethod, project.getEndpoint() + request.getPath());
+                // 构建请求
+                HttpMethod httpMethod = HttpMethod.valueOf(request.getMethod());
+                String fullUrl = project.getEndpoint() + request.getPath();
+                
+                log.info("构建完整URL: {} (方法: {})", fullUrl, httpMethod);
+                log.debug("请求头: {}", request.getHeaders().encodePrettily());
 
-
-            // client.request() 返回 Future<HttpClientRequest>
-            client.request(httpMethod, fullUrl)
-                    .onSuccess(clientRequest -> {
-                        // 添加请求头
+                // 创建HTTP请求 - 非函数调用方式
+                io.vertx.core.Future<HttpClientRequest> requestFuture = client.request(httpMethod, fullUrl);
+                
+                // 处理请求创建结果
+                requestFuture.onComplete(ar -> {
+                    if (ar.succeeded()) {
+                        HttpClientRequest clientRequest = ar.result();
+                        log.debug("HTTP请求创建成功: {}", fullUrl);
+                        
+                        // 添加请求头 - 过滤和修正不合适的请求头
+                        log.debug("开始添加请求头...");
+                        
+                        // 先添加必要的API请求头
+                        clientRequest.putHeader("Content-Type", "application/json");
+                        clientRequest.putHeader("Accept", "application/json");
+                        log.debug("添加默认请求头: Content-Type = application/json");
+                        log.debug("添加默认请求头: Accept = application/json");
+                        
                         request.getHeaders().forEach(entry -> {
-                            clientRequest.putHeader(entry.getKey(), String.valueOf(entry.getValue()));
+                            String key = entry.getKey();
+                            String value = String.valueOf(entry.getValue());
+                            
+                            // 过滤掉浏览器特有的请求头
+                            if (shouldFilterHeader(key)) {
+                                log.debug("过滤请求头: {} = {}", key, value);
+                                return;
+                            }
+                            
+                            // 修正Host头
+                            if ("Host".equalsIgnoreCase(key)) {
+                                // 从endpoint中提取正确的host和port
+                                try {
+                                    java.net.URL url = new java.net.URL(project.getEndpoint());
+                                    String correctHost = url.getHost() + ":" + (url.getPort() == -1 ? url.getDefaultPort() : url.getPort());
+                                    clientRequest.putHeader("Host", correctHost);
+                                    log.debug("修正Host请求头: {} -> {}", value, correctHost);
+                                } catch (Exception e) {
+                                    log.warn("无法解析endpoint，使用原始Host头: {}", value);
+                                    clientRequest.putHeader(key, value);
+                                }
+                            } else if ("Content-Type".equalsIgnoreCase(key) || "Accept".equalsIgnoreCase(key)) {
+                                // 覆盖默认的Content-Type和Accept
+                                clientRequest.putHeader(key, value);
+                                log.debug("覆盖请求头: {} = {}", key, value);
+                            } else {
+                                clientRequest.putHeader(key, value);
+                                log.debug("添加请求头: {} = {}", key, value);
+                            }
                         });
 
+                        // 发送请求体
+                        io.vertx.core.buffer.Buffer requestBody = io.vertx.core.buffer.Buffer.buffer(request.getBody());
+                        log.debug("发送请求体，大小: {} bytes", requestBody.length());
+                        
                         // 发送请求
-                        clientRequest.send(io.vertx.core.buffer.Buffer.buffer(request.getBody()))
-                                .onSuccess(response -> {
-                                    long duration = System.currentTimeMillis() - startTime;
+                        io.vertx.core.Future<io.vertx.core.http.HttpClientResponse> sendFuture = clientRequest.send(requestBody);
+                        
+                        // 处理发送结果
+                        sendFuture.onComplete(sendAr -> {
+                            if (sendAr.succeeded()) {
+                                io.vertx.core.http.HttpClientResponse response = sendAr.result();
+                                long duration = System.currentTimeMillis() - startTime;
+                                
+                                log.info("HTTP请求发送成功: {} -> {} ({}ms) [状态码: {}]", 
+                                        request.getRequestId(), project.getEndpoint(), duration, response.statusCode());
+                                
+                                // 处理响应体
+                                response.bodyHandler(body -> {
+                                    String responseBody = body.toString();
+                                    log.debug("收到响应体，大小: {} bytes", responseBody.length());
+                                    log.debug("响应体内容: {}", responseBody);
 
-                                    response.bodyHandler(body -> {
-                                        String responseBody = body.toString();
+                                    // 记录请求结果
+                                    boolean isSuccess = response.statusCode() < 400;
+                                    healthChecker.recordRequestResult(project.getServiceName(), isSuccess);
+                                    
+                                    if (!isSuccess) {
+                                        log.warn("请求返回错误状态码: {} - 响应体: {}", response.statusCode(), responseBody);
+                                    }
 
-                                        // 记录请求结果
-                                        healthChecker.recordRequestResult(project.getServiceName(), response.statusCode() < 400);
-
-                                        // 收集响应头
-                                        Map<String, Object> responseHeaders = new HashMap<>();
-                                        response.headers().forEach(entry -> {
-                                            responseHeaders.put(entry.getKey(), entry.getValue());
-                                        });
-
-                                        VertxDispatchResult result = VertxDispatchResult.success(
-                                                responseBody, project.getEndpoint(), duration, 
-                                                response.statusCode(), responseHeaders
-                                        );
-
-                                        log.debug("请求完成: {} -> {} ({}ms) [{}]", request.getRequestId(), project.getEndpoint(), duration, response.statusCode());
-
-                                        promise.complete(result);
+                                    // 收集响应头
+                                    Map<String, Object> responseHeaders = new HashMap<>();
+                                    response.headers().forEach(entry -> {
+                                        responseHeaders.put(entry.getKey(), entry.getValue());
+                                        log.debug("响应头: {} = {}", entry.getKey(), entry.getValue());
                                     });
-                                })
-                                .onFailure(throwable -> {
-                                    long duration = System.currentTimeMillis() - startTime;
 
-                                    log.error("HTTP请求失败", throwable);
+                                    VertxDispatchResult result = VertxDispatchResult.success(
+                                            responseBody, project.getEndpoint(), duration, 
+                                            response.statusCode(), responseHeaders
+                                    );
 
-                                    // 记录失败
+                                    log.info("请求完成: {} -> {} ({}ms) [{}]", 
+                                            request.getRequestId(), project.getEndpoint(), duration, response.statusCode());
+
+                                    promise.complete(result);
+                                });
+                                
+                                // 处理响应体读取失败
+                                response.exceptionHandler(throwable -> {
+                                    long duration1 = System.currentTimeMillis() - startTime;
+                                    log.error("读取响应体失败: {}", throwable.getMessage(), throwable);
+                                    
                                     healthChecker.recordRequestResult(project.getServiceName(), false);
-
                                     promise.complete(VertxDispatchResult.failure(
-                                            "HTTP请求失败: " + throwable.getMessage(), duration
+                                            "读取响应体失败: " + throwable.getMessage(), duration1
                                     ));
                                 });
-                    })
-                    .onFailure(throwable -> {
-                        long duration = System.currentTimeMillis() - startTime;
+                                
+                            } else {
+                                // 发送请求失败
+                                long duration = System.currentTimeMillis() - startTime;
+                                Throwable throwable = sendAr.cause();
+                                
+                                log.error("HTTP请求发送失败: {} -> {} ({}ms)", 
+                                        request.getRequestId(), project.getEndpoint(), duration, throwable);
+                                log.error("发送失败详情: {}", throwable.getMessage(), throwable);
 
-                        log.error("创建HTTP请求失败", throwable);
+                                // 记录失败
+                                healthChecker.recordRequestResult(project.getServiceName(), false);
+
+                                promise.complete(VertxDispatchResult.failure(
+                                        "HTTP请求发送失败: " + throwable.getMessage(), duration
+                                ));
+                            }
+                        });
+                        
+                    } else {
+                        // 创建HTTP请求失败
+                        long duration = System.currentTimeMillis() - startTime;
+                        Throwable throwable = ar.cause();
+                        
+                        log.error("创建HTTP请求失败: {} -> {} ({}ms)", 
+                                request.getRequestId(), project.getEndpoint(), duration, throwable);
+                        log.error("创建失败详情: {}", throwable.getMessage(), throwable);
 
                         promise.complete(VertxDispatchResult.failure(
                                 "创建HTTP请求失败: " + throwable.getMessage(), duration
                         ));
-                    });
+                    }
+                });
+                
+            } catch (Exception e) {
+                long duration = System.currentTimeMillis() - startTime;
+                log.error("执行分发时发生异常: {} -> {} ({}ms)", 
+                        request.getRequestId(), project.getEndpoint(), duration, e);
+                log.error("异常详情: {}", e.getMessage(), e);
+                
+                promise.complete(VertxDispatchResult.failure(
+                        "执行分发异常: " + e.getMessage(), duration
+                ));
+            }
         });
+    }
+
+    /**
+     * 判断是否应该过滤请求头
+     */
+    private boolean shouldFilterHeader(String headerName) {
+        if (headerName == null) {
+            return true;
+        }
+        
+        String lowerName = headerName.toLowerCase();
+        
+        // 过滤浏览器特有的请求头
+        return lowerName.startsWith("sec-") ||           // 浏览器安全策略头
+               lowerName.startsWith("sec-ch-") ||       // 浏览器客户端提示头
+               "upgrade-insecure-requests".equals(lowerName) ||  // 浏览器安全升级
+               "sec-fetch-site".equals(lowerName) ||     // 浏览器安全策略
+               "sec-fetch-mode".equals(lowerName) ||     // 浏览器安全策略
+               "sec-fetch-dest".equals(lowerName) ||     // 浏览器安全策略
+               "sec-fetch-user".equals(lowerName) ||     // 浏览器安全策略
+               "dnt".equals(lowerName) ||                // Do Not Track
+               "save-data".equals(lowerName);            // 数据保存偏好
     }
 
     /**
@@ -375,6 +533,18 @@ public class VertxDispatcher {
         projectRegistry.computeIfAbsent(serviceName, k -> new ArrayList<>()).add(project);
         healthChecker.registerCircuitBreaker(serviceName);
         log.info("注册聚合项目: {} -> {}", serviceName, project.getEndpoint());
+    }
+
+    /**
+     * 注册聚合项目
+     */
+    public void unRegisterProject(String serviceName, VertxAggregateProject project) {
+
+        List<VertxAggregateProject> vertxAggregateProjects = projectRegistry.get(serviceName);
+        if (vertxAggregateProjects != null) {
+            vertxAggregateProjects.remove(project);
+        }
+        log.info("注销聚合项目: {} -> {}", serviceName, project.getEndpoint());
     }
 
     /**
@@ -461,6 +631,39 @@ public class VertxDispatcher {
                             .putHeader("Content-Type", "application/json")
                             .end(new JsonObject().put("error", "测试失败: " + throwable.getMessage()).encode());
                 });
+    }
+
+    public void handleUnRegister(RoutingContext ctx) {
+        JsonObject projectData = ctx.getBodyAsJson();
+        if (projectData == null) {
+            ctx.response()
+                    .setStatusCode(400)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "请求体不能为空").encode());
+            return;
+        }
+
+        String serviceName = projectData.getString("serviceName");
+        String projectName = projectData.getString("projectName");
+        String endpoint = projectData.getString("endpoint");
+
+        if (serviceName == null || projectName == null || endpoint == null) {
+            ctx.response()
+                    .setStatusCode(400)
+                    .putHeader("Content-Type", "application/json")
+                    .end(new JsonObject().put("error", "缺少必要参数").encode());
+            return;
+        }
+
+        VertxAggregateProject project = new VertxAggregateProject(projectName, endpoint, serviceName);
+        unRegisterProject(serviceName, project);
+
+        JsonObject response = new JsonObject()
+                .put("message", "聚合项目注销成功: " + serviceName + " -> " + endpoint);
+
+        ctx.response()
+                .putHeader("Content-Type", "application/json")
+                .end(response.encode());
     }
 }
 

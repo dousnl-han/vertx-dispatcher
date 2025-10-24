@@ -128,6 +128,9 @@ public class VertxGatewayMain extends AbstractVerticle {
         // 注册聚合项目
         router.post("/gateway/register").handler(dispatcher::handleRegister);
 
+        // 注册聚合项目
+        router.post("/gateway/unregister").handler(dispatcher::handleUnRegister);
+
         // 获取服务状态
         router.get("/gateway/status").handler(dispatcher::handleStatus);
 

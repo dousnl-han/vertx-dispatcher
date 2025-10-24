@@ -202,3 +202,4 @@ curl http://localhost:8080/gateway/status
 - **可扩展**: 支持多实例负载均衡
 
 现在你可以直接使用 `http://localhost:8080/user-orch/hello` 这样的URL来访问服务，网关会自动分发到对应的Spring Boot服务！
+
